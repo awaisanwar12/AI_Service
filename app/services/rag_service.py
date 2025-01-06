@@ -13,142 +13,246 @@ import json
 import hashlib
 import datetime
 import numpy as np
+import time
+from sentence_transformers import SentenceTransformer
+
+# Disable noisy logs
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+# Configure service-specific logging with clear formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Create loggers with custom names for clarity
+logger = logging.getLogger('RAG')
+redis_logger = logging.getLogger('REDIS')
+pinecone_logger = logging.getLogger('PINECONE')
+xai_logger = logging.getLogger('X-AI')
 
 settings = get_settings()
-logger = logging.getLogger(__name__)
 
 class RAGService:
     def __init__(self):
         try:
-            # Create an instance of Pinecone
-            self.pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-            logger.info("Pinecone client initialized")
+            logger.info("Starting RAG service initialization...")
+            start_time = time.time()
             
-            # Connect to the index with specific host
+            # Initialize the embedding model
+            logger.info("Loading E5 large embedding model...")
+            self.embedding_model = SentenceTransformer('intfloat/multilingual-e5-large')
+            logger.info("Embedding model loaded successfully")
+            
+            # Create an instance of Pinecone
+            pinecone_logger.info(f"Connecting to Pinecone [API: {os.environ.get('PINECONE_API_KEY')[:5]}...]")
+            self.pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
+            pinecone_logger.info("Pinecone client initialized")
+            
+            # Connect to the index
+            pinecone_logger.info("Connecting to index: awais-test")
             self.index = self.pc.Index(
                 "awais-test",
                 host="https://awais-test-8unj2wq.svc.aped-4627-b74a.pinecone.io"
             )
             
-            # Get index info to verify dimension
+            # Get index info
             index_info = self.index.describe_index_stats()
-            logger.info(f"Connected to Pinecone index. Index stats: {index_info}")
+            stats_dict = {
+                "dimension": index_info.dimension,
+                "total_vectors": index_info.total_vector_count,
+                "namespaces": {ns: {"count": info.vector_count} for ns, info in index_info.namespaces.items()}
+            }
+            pinecone_logger.info(f"Connected to Pinecone index | Stats: {json.dumps(stats_dict)}")
             
-            # Initialize vector store
-            self.vector_store = None
-            self.initialize_services()
+            end_time = time.time()
+            logger.info(f"RAG service initialized in {end_time - start_time:.1f}s")
             
         except Exception as e:
             logger.error(f"Failed to initialize RAG service: {str(e)}")
             raise
 
-    def initialize_services(self):
-        """Initialize Pinecone and LangChain services"""
+    def get_embedding(self, text: str) -> List[float]:
+        """Get embeddings using multilingual-e5-large model"""
         try:
-            # Initialize vector store with correct dimension
-            self.vector_store = PineconeVectorStore(
-                self.index,
-                self._text_to_sparse_vector,  # Use our sparse vector function
-                "text"
-            )
-            logger.info("RAG service initialized successfully")
-            
-            # Test vector dimension
-            test_vector = self._text_to_sparse_vector("test")
-            logger.info(f"Test vector dimension: {len(test_vector)}")
-            
+            # Normalize text
+            text = ' '.join(text.lower().split())
+            # Generate embedding
+            embedding = self.embedding_model.encode(text)
+            return embedding.tolist()
         except Exception as e:
-            logger.error(f"Failed to initialize RAG service: {str(e)}")
+            logger.error(f"Error generating embedding: {str(e)}")
             raise
 
     async def process_message(self, message: str, response: str):
-        """Store message and response in Pinecone"""
+        """Process message with Redis -> Pinecone -> X AI fallback"""
+        process_start = time.time()
         try:
-            # Get the response from X AI first
-            x_ai_response = await self.generate_content(message)
+            logger.info("=" * 80)
+            logger.info(f"NEW MESSAGE: '{message[:100]}'")
             
-            # Prepare metadata
+            # 1. Check Redis cache
+            redis_logger.info("Step 1: Checking Redis cache...")
+            cache_key = f"response:{hashlib.md5(message.encode()).hexdigest()}"
+            cached_response = await redis_service.get_cache(cache_key)
+            
+            if cached_response:
+                redis_logger.info("SUCCESS: Found response in Redis cache")
+                logger.info("-" * 40)
+                logger.info("RESPONSE SOURCE: Redis Cache")
+                logger.info(f"RESPONSE PREVIEW: {cached_response['text'][:100]}...")
+                logger.info(f"RESPONSE LENGTH: {len(cached_response['text'])} characters")
+                logger.info(f"TOTAL TIME: {time.time() - process_start:.1f}s")
+                logger.info("=" * 80)
+                return cached_response
+            
+            redis_logger.info("INFO: No cache found in Redis")
+            
+            # 2. Search Pinecone
+            pinecone_logger.info("Step 2: Searching Pinecone database...")
+            similar_responses = await self.search_similar(message, limit=3)  # Get top 3 to log alternatives
+            
+            # Log all potential matches for debugging
+            if similar_responses:
+                pinecone_logger.info("Found potential matches:")
+                for idx, resp in enumerate(similar_responses):
+                    pinecone_logger.info(f"Match {idx + 1}:")
+                    pinecone_logger.info(f"  Score: {resp['score']:.3f}")
+                    pinecone_logger.info(f"  Query: '{message}'")
+                    pinecone_logger.info(f"  Matched: '{resp['message']}'")
+            
+            # Check for good match - increased threshold to 0.85 for better accuracy
+            if similar_responses and similar_responses[0]["score"] > 0.85:
+                pinecone_logger.info(f"SUCCESS: Found similar message in Pinecone [similarity: {similar_responses[0]['score']:.3f}]")
+                pinecone_logger.info("-" * 40)
+                pinecone_logger.info("MATCH DETAILS:")
+                pinecone_logger.info(f"User Query: '{message}'")
+                pinecone_logger.info(f"Matched Query: '{similar_responses[0]['message']}'")
+                pinecone_logger.info(f"Similarity Score: {similar_responses[0]['score']:.3f}")
+                pinecone_logger.info("-" * 40)
+                
+                existing_response = {
+                    "text": similar_responses[0]["response"],
+                    "image_url": None
+                }
+                
+                # Cache for future use
+                redis_logger.info("INFO: Caching Pinecone response in Redis")
+                await redis_service.cache_response(message, existing_response)
+                
+                logger.info("-" * 40)
+                logger.info("RESPONSE SOURCE: Pinecone Database")
+                logger.info(f"RESPONSE PREVIEW: {existing_response['text'][:100]}...")
+                logger.info(f"RESPONSE LENGTH: {len(existing_response['text'])} characters")
+                logger.info(f"SIMILARITY SCORE: {similar_responses[0]['score']:.3f}")
+                logger.info(f"TOTAL TIME: {time.time() - process_start:.1f}s")
+                logger.info("=" * 80)
+                return existing_response
+            
+            pinecone_logger.info("INFO: No sufficiently similar response found in Pinecone (threshold: 0.85)")
+            
+            # 3. Get X AI response
+            xai_logger.info("Step 3: Requesting new response from X AI...")
+            xai_start = time.time()
+            x_ai_response = await self.generate_content(message)
+            xai_end = time.time()
+            xai_logger.info(f"SUCCESS: Got response from X AI in {xai_end - xai_start:.1f}s")
+            
+            # Store in Pinecone for future use
+            store_start = time.time()
+            embedding = self.get_embedding(message)
+            
             metadata = {
                 "type": "conversation",
                 "message": message,
                 "response": x_ai_response.get("text", ""),
-                "timestamp": str(datetime.datetime.now()),
-                "normalized_message": ' '.join(message.lower().split())  # Store normalized message
+                "timestamp": str(datetime.datetime.now())
             }
-
-            # Create unique ID for the vector
-            vector_id = f"conv_{hashlib.md5((message).encode()).hexdigest()}"
-            logger.info(f"Storing vector with ID: {vector_id}")
-
-            # Convert message to vector (only use message for matching)
-            vector = self._text_to_sparse_vector(message)
             
-            logger.info(f"Vector dimension: {len(vector)}")
-
-            # Store in Pinecone
+            vector_id = f"conv_{hashlib.md5((message).encode()).hexdigest()}"
+            pinecone_logger.info(f"INFO: Storing X AI response in Pinecone [id: {vector_id}]")
+            
             try:
-                upsert_response = self.index.upsert(
-                    vectors=[(
-                        vector_id,
-                        vector,
-                        metadata
-                    )]
+                self.index.upsert(
+                    vectors=[(vector_id, embedding, metadata)]
                 )
-                logger.info(f"Pinecone upsert response: {upsert_response}")
+                store_end = time.time()
+                pinecone_logger.info(f"SUCCESS: Response stored in Pinecone ({store_end - store_start:.1f}s)")
             except Exception as e:
-                logger.error(f"Pinecone upsert error: {str(e)}")
+                pinecone_logger.error(f"ERROR: Failed to store in Pinecone: {str(e)}")
                 raise
             
-            # Verify the vector was stored
-            stats = self.index.describe_index_stats()
-            logger.info(f"Current index stats: {stats}")
+            # Cache in Redis
+            redis_logger.info("INFO: Caching X AI response in Redis")
+            await redis_service.cache_response(message, x_ai_response)
+            
+            logger.info("-" * 40)
+            logger.info("RESPONSE SOURCE: X AI API")
+            logger.info(f"RESPONSE PREVIEW: {x_ai_response['text'][:100]}...")
+            logger.info(f"RESPONSE LENGTH: {len(x_ai_response['text'])} characters")
+            logger.info(f"GENERATION TIME: {xai_end - xai_start:.1f}s")
+            logger.info(f"TOTAL TIME: {time.time() - process_start:.1f}s")
+            logger.info("=" * 80)
 
             return x_ai_response
 
         except Exception as e:
-            logger.error(f"Error storing message in Pinecone: {str(e)}")
+            logger.error("ERROR PROCESSING MESSAGE:")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error message: {str(e)}")
+            logger.error("=" * 80)
             raise
 
-    def _text_to_sparse_vector(self, text: str) -> List[float]:
-        """Convert text to sparse vector using consistent hashing"""
+    async def search_similar(self, query: str, limit: int = 5) -> List[Dict]:
+        """Search for similar content in Pinecone using proper embeddings"""
+        search_start = time.time()
         try:
-            # Normalize text: lowercase, remove extra spaces, basic cleaning
-            text = text.lower()
-            text = ' '.join(text.split())  # Remove extra spaces
-            text = ''.join(c for c in text if c.isalnum() or c.isspace())  # Remove punctuation
+            # Get embedding for query
+            pinecone_logger.info(f"Generating embedding for query: '{query}'")
+            query_vector = self.get_embedding(query)
             
-            # Create a consistent hash for the text
-            text_hash = hashlib.md5(text.encode()).hexdigest()
-            logger.info(f"Normalized text: '{text}'")
+            # Search in Pinecone
+            search_start_time = time.time()
+            results = self.index.query(
+                vector=query_vector,
+                top_k=limit,
+                include_metadata=True
+            )
+            search_end = time.time()
+            pinecone_logger.info(f"✅ Search completed in {search_end - search_start_time:.2f} seconds")
             
-            # Generate consistent vector
-            vector = np.zeros(1024)
-            words = text.split()
-            
-            # Count word frequencies
-            word_freq = {}
-            for word in words:
-                word_freq[word] = word_freq.get(word, 0) + 1
-            
-            # Generate vector components
-            for word, freq in word_freq.items():
-                # Generate a consistent index for each word
-                word_hash = int(hashlib.md5(word.encode()).hexdigest(), 16)
-                index = word_hash % 1024
-                
-                # Set the value using term frequency
-                vector[index] = freq / len(words)
-            
-            # Normalize the vector
-            norm = np.linalg.norm(vector)
-            if norm > 0:
-                vector = vector / norm
-            
-            logger.info(f"Generated vector for text: '{text}' with hash: {text_hash[:8]}")
-            return vector.tolist()
-            
+            # Convert results to JSON-serializable format
+            results_dict = {
+                "matches": [{
+                    "id": match.id,
+                    "score": float(match.score),
+                    "metadata": match.metadata
+                } for match in results.matches]
+            }
+            pinecone_logger.debug(f"Search results: {json.dumps(results_dict, indent=2)}")
+
+            # Format results
+            formatted_results = []
+            for match in results.matches:
+                formatted_results.append({
+                    "score": float(match.score),
+                    "message": match.metadata.get("message"),
+                    "response": match.metadata.get("response"),
+                    "timestamp": match.metadata.get("timestamp")
+                })
+
+            total_time = time.time() - search_start
+            logger.info(f"✨ Total search time: {total_time:.2f} seconds")
+            logger.info(f"Found {len(formatted_results)} matches")
+            logger.info("=" * 50)
+
+            return formatted_results
+
         except Exception as e:
-            logger.error(f"Error generating vector: {str(e)}")
+            logger.error(f"❌ Error searching in Pinecone: {str(e)}", exc_info=True)
             raise
 
     async def add_document(self, title: str, content: str) -> str:
@@ -182,39 +286,6 @@ class RAGService:
             logger.error(f"Error adding document to vector store: {str(e)}")
             raise
 
-    async def search_similar(self, query: str, limit: int = 5) -> List[Dict]:
-        """Search for similar content in Pinecone using sparse vectors"""
-        try:
-            # Normalize query the same way as stored text
-            query = ' '.join(query.lower().split())
-            logger.info(f"Searching Pinecone for normalized query: '{query}'")
-            
-            # Convert query to vector
-            query_vector = self._text_to_sparse_vector(query)
-            
-            # Search in Pinecone
-            results = self.index.query(
-                vector=query_vector,
-                top_k=limit,
-                include_metadata=True
-            )
-
-            # Format results without logging
-            formatted_results = []
-            for match in results.matches:
-                formatted_results.append({
-                    "score": float(match.score),
-                    "message": match.metadata.get("message"),
-                    "response": match.metadata.get("response"),
-                    "timestamp": match.metadata.get("timestamp")
-                })
-
-            return formatted_results
-
-        except Exception as e:
-            logger.error(f"Error searching in Pinecone: {str(e)}")
-            raise
-
     async def get_x_ai_embeddings(self, text: str) -> List[float]:
         """Get embeddings from X AI API"""
         try:
@@ -246,31 +317,9 @@ class RAGService:
             raise
 
     async def generate_content(self, prompt: str) -> Dict[str, Optional[str]]:
-        """
-        Generate content using X AI API with caching and RAG
-        """
+        """Generate content using X AI API"""
         try:
-            # Generate a cache key from the prompt
-            cache_key = f"response:{hashlib.md5(prompt.encode()).hexdigest()}"
-            
-            # Try to get cached response
-            cached_response = await redis_service.get_cache(cache_key)
-            if cached_response:
-                logger.info("Using cached response")
-                return cached_response
-
-            # If no cache hit, generate new response
-            is_image_request = any(word in prompt.lower() 
-                                 for word in ['image', 'picture', 'draw', 'generate'])
-
-            system_prompt = (
-                "You are a witty and humorous AI assistant with a great sense of humor. "
-                "Always respond in a lighthearted, entertaining way, incorporating jokes, "
-                "wordplay, or funny observations when appropriate. Keep responses clever "
-                "and amusing while still being helpful."
-            )
-
-            logger.info(f"Sending request to X AI API with prompt: {prompt[:100]}...")
+            xai_logger.info(f"Sending request to X AI API with prompt: {prompt[:100]}...")
 
             async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
                 response = await client.post(
@@ -280,7 +329,7 @@ class RAGService:
                         "messages": [
                             {
                                 "role": "system",
-                                "content": system_prompt
+                                "content": "You are a witty and humorous AI assistant with a great sense of humor. Always respond in a lighthearted, entertaining way, incorporating jokes, wordplay, or funny observations when appropriate."
                             },
                             {
                                 "role": "user",
@@ -299,14 +348,14 @@ class RAGService:
                 )
                 
                 if response.status_code != 200:
-                    logger.error(f"X AI API error: Status {response.status_code}, Response: {response.text}")
+                    xai_logger.error(f"❌ X AI API error: Status {response.status_code}, Response: {response.text}")
                     return {
                         "text": "I apologize, but I encountered an error. Please try again.",
                         "image_url": None
                     }
 
                 data = response.json()
-                logger.info("Successfully received response from X AI API")
+                xai_logger.info("✅ Successfully received response from X AI API")
 
                 result = {
                     "text": "",
@@ -316,19 +365,24 @@ class RAGService:
                 if data.get("choices") and len(data["choices"]) > 0:
                     result["text"] = data["choices"][0]["message"]["content"]
                     
-                    if is_image_request and "http" in result["text"]:
+                    # Handle image URLs if present
+                    if "http" in result["text"]:
                         import re
                         urls = re.findall(r'(https?://[^\s]+)', result["text"])
                         if urls:
                             result["image_url"] = urls[0]
 
-                    # Cache the response
-                    await redis_service.cache_response(prompt, result)
-
-                return result
+                    xai_logger.debug(f"Generated response: {result['text'][:200]}...")
+                    return result
+                else:
+                    xai_logger.warning("⚠️ No choices in X AI response")
+                    return {
+                        "text": "I apologize, but I couldn't generate a proper response. Please try again.",
+                        "image_url": None
+                    }
 
         except Exception as e:
-            logger.error(f"Error generating content: {str(e)}", exc_info=True)
+            xai_logger.error(f"❌ Error generating content: {str(e)}", exc_info=True)
             return {
                 "text": "I apologize, but something went wrong. Please try again.",
                 "image_url": None
