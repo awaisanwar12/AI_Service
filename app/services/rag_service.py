@@ -8,6 +8,7 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from app.core.config import get_settings
 from app.services.redis_service import redis_service
+from app.utils.gaming_data import GAME_NAMES, get_all_gaming_terms, get_game_aliases
 import logging
 import json
 import hashlib
@@ -41,6 +42,11 @@ class RAGService:
         try:
             logger.info("Starting RAG service initialization...")
             start_time = time.time()
+            
+            # Load gaming terms and aliases
+            self.gaming_terms = get_all_gaming_terms()
+            self.game_aliases = get_game_aliases()
+            logger.info(f"Loaded {len(self.gaming_terms)} gaming terms and {len(self.game_aliases)} game aliases")
             
             # Initialize the embedding model
             logger.info("Loading E5 large embedding model...")
@@ -88,31 +94,11 @@ class RAGService:
             raise
 
     def is_gaming_related(self, text: str) -> bool:
-        """Check if the text is related to gaming"""
-        gaming_keywords = {
-            # General gaming terms
-            'game', 'gaming', 'play', 'player', 'gamer', 'gameplay', 'playthrough',
-            # Platforms
-            'pc', 'console', 'playstation', 'ps4', 'ps5', 'xbox', 'nintendo', 'switch',
-            # Game types
-            'rpg', 'fps', 'mmorpg', 'strategy', 'puzzle', 'arcade', 'simulator',
-            # Gaming actions
-            'level', 'score', 'achievement', 'quest', 'mission', 'boss', 'character',
-            # Popular games
-            'minecraft', 'fortnite', 'cod', 'gta', 'league of legends', 'valorant',
-            # Gaming hardware
-            'controller', 'keyboard', 'mouse', 'headset', 'gpu', 'graphics card',
-            # Gaming terms
-            'spawn', 'respawn', 'loot', 'inventory', 'skill', 'weapon', 'map',
-            # Esports
-            'tournament', 'competitive', 'esports', 'stream', 'twitch'
-        }
-        
-        # Convert text to lowercase for matching
+        """Check if the text is related to gaming using loaded gaming terms"""
         text = text.lower()
         
-        # Check if any gaming keyword is in the text
-        return any(keyword in text for keyword in gaming_keywords)
+        # Check if any gaming term is in the text
+        return any(term in text for term in self.gaming_terms)
 
     async def process_message(self, message: str, response: str):
         """Process message with Redis -> Pinecone -> X AI fallback"""
@@ -131,6 +117,19 @@ class RAGService:
                 }
             
             logger.info("MESSAGE ACCEPTED: Gaming related")
+            
+            # Extract game name from message if possible
+            message_lower = message.lower()
+            detected_game = None
+            
+            # Check for game names using aliases
+            for alias, main_name in self.game_aliases.items():
+                if alias in message_lower:
+                    detected_game = main_name
+                    break
+            
+            if detected_game:
+                logger.info(f"Detected game: {detected_game}")
             
             # 1. Check Redis cache
             redis_logger.info("Step 1: Checking Redis cache...")
@@ -151,7 +150,7 @@ class RAGService:
             
             # 2. Search Pinecone
             pinecone_logger.info("Step 2: Searching Pinecone database...")
-            similar_responses = await self.search_similar(message, limit=3)  # Get top 3 to log alternatives
+            similar_responses = await self.search_similar(message, limit=3)
             
             # Log all potential matches for debugging
             if similar_responses:
@@ -161,19 +160,29 @@ class RAGService:
                     pinecone_logger.info(f"  Score: {resp['score']:.3f}")
                     pinecone_logger.info(f"  Query: '{message}'")
                     pinecone_logger.info(f"  Matched: '{resp['message']}'")
+                    
+                    # Check if the matched response is for the same game
+                    matched_message = resp['message'].lower()
+                    if detected_game and not any(alias in matched_message for alias in self.game_aliases.get(detected_game, [])):
+                        pinecone_logger.info(f"  REJECTED: Different game than query ({detected_game})")
+                        continue
             
-            # Check for good match - increased threshold to 0.85 for better accuracy
-            if similar_responses and similar_responses[0]["score"] > 0.85:
-                pinecone_logger.info(f"SUCCESS: Found similar message in Pinecone [similarity: {similar_responses[0]['score']:.3f}]")
-                pinecone_logger.info("-" * 40)
-                pinecone_logger.info("MATCH DETAILS:")
-                pinecone_logger.info(f"User Query: '{message}'")
-                pinecone_logger.info(f"Matched Query: '{similar_responses[0]['message']}'")
-                pinecone_logger.info(f"Similarity Score: {similar_responses[0]['score']:.3f}")
-                pinecone_logger.info("-" * 40)
+            # Check for good match - increased threshold and must be same game if game detected
+            if similar_responses and similar_responses[0]["score"] > 0.90:  # Increased threshold
+                best_match = similar_responses[0]
+                
+                # If a specific game was detected, ensure the match is for the same game
+                if detected_game:
+                    matched_message = best_match['message'].lower()
+                    if not any(alias in matched_message for alias in self.game_aliases.get(detected_game, [])):
+                        pinecone_logger.info(f"REJECTED: Best match was for different game than query ({detected_game})")
+                        # Fall through to X AI for a new response
+                    else:
+                        pinecone_logger.info(f"ACCEPTED: Match is for the same game ({detected_game})")
+                        # Rest of the code for using the match...
                 
                 existing_response = {
-                    "text": similar_responses[0]["response"],
+                    "text": best_match["response"],
                     "image_url": None
                 }
                 
@@ -185,12 +194,12 @@ class RAGService:
                 logger.info("RESPONSE SOURCE: Pinecone Database")
                 logger.info(f"RESPONSE PREVIEW: {existing_response['text'][:100]}...")
                 logger.info(f"RESPONSE LENGTH: {len(existing_response['text'])} characters")
-                logger.info(f"SIMILARITY SCORE: {similar_responses[0]['score']:.3f}")
+                logger.info(f"SIMILARITY SCORE: {best_match['score']:.3f}")
                 logger.info(f"TOTAL TIME: {time.time() - process_start:.1f}s")
                 logger.info("=" * 80)
                 return existing_response
             
-            pinecone_logger.info("INFO: No sufficiently similar response found in Pinecone (threshold: 0.85)")
+            pinecone_logger.info("INFO: No sufficiently similar response found in Pinecone (threshold: 0.90)")
             
             # 3. Get X AI response
             xai_logger.info("Step 3: Requesting new response from X AI...")
