@@ -87,12 +87,50 @@ class RAGService:
             logger.error(f"Error generating embedding: {str(e)}")
             raise
 
+    def is_gaming_related(self, text: str) -> bool:
+        """Check if the text is related to gaming"""
+        gaming_keywords = {
+            # General gaming terms
+            'game', 'gaming', 'play', 'player', 'gamer', 'gameplay', 'playthrough',
+            # Platforms
+            'pc', 'console', 'playstation', 'ps4', 'ps5', 'xbox', 'nintendo', 'switch',
+            # Game types
+            'rpg', 'fps', 'mmorpg', 'strategy', 'puzzle', 'arcade', 'simulator',
+            # Gaming actions
+            'level', 'score', 'achievement', 'quest', 'mission', 'boss', 'character',
+            # Popular games
+            'minecraft', 'fortnite', 'cod', 'gta', 'league of legends', 'valorant',
+            # Gaming hardware
+            'controller', 'keyboard', 'mouse', 'headset', 'gpu', 'graphics card',
+            # Gaming terms
+            'spawn', 'respawn', 'loot', 'inventory', 'skill', 'weapon', 'map',
+            # Esports
+            'tournament', 'competitive', 'esports', 'stream', 'twitch'
+        }
+        
+        # Convert text to lowercase for matching
+        text = text.lower()
+        
+        # Check if any gaming keyword is in the text
+        return any(keyword in text for keyword in gaming_keywords)
+
     async def process_message(self, message: str, response: str):
         """Process message with Redis -> Pinecone -> X AI fallback"""
         process_start = time.time()
         try:
             logger.info("=" * 80)
             logger.info(f"NEW MESSAGE: '{message[:100]}'")
+            
+            # Check if message is gaming related
+            if not self.is_gaming_related(message):
+                logger.info("MESSAGE REJECTED: Not gaming related")
+                logger.info("=" * 80)
+                return {
+                    "text": "I can only help with gaming-related questions. Please ask me about games, gaming, or anything related to gaming!",
+                    "image_url": None
+                }
+            
+            logger.info("MESSAGE ACCEPTED: Gaming related")
             
             # 1. Check Redis cache
             redis_logger.info("Step 1: Checking Redis cache...")
@@ -329,7 +367,16 @@ class RAGService:
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "You are a witty and humorous AI assistant with a great sense of humor. Always respond in a lighthearted, entertaining way, incorporating jokes, wordplay, or funny observations when appropriate."
+                                "content": """You are a gaming expert and enthusiast AI assistant. You have extensive knowledge about:
+- Video games across all platforms (PC, consoles, mobile)
+- Gaming hardware and peripherals
+- Esports and competitive gaming
+- Game mechanics and strategies
+- Gaming culture and community
+
+Always provide gaming-focused responses with accurate, helpful information. Include gaming terminology and references when appropriate. Be enthusiastic about gaming while maintaining a friendly, approachable tone.
+
+If a question is not related to gaming, politely explain that you can only help with gaming-related topics."""
                             },
                             {
                                 "role": "user",
@@ -337,7 +384,7 @@ class RAGService:
                             }
                         ],
                         "max_tokens": 1000,
-                        "temperature": 0.8,
+                        "temperature": 0.7,
                         "presence_penalty": 0.6,
                         "frequency_penalty": 0.5
                     },
