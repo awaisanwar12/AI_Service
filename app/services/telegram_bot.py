@@ -148,6 +148,12 @@ class TelegramBotService:
         logger.info(f"  - Chat ID: {chat_id}")
         
         try:
+            # Show typing indicator
+            await context.bot.send_chat_action(
+                chat_id=chat_id,
+                action="typing"
+            )
+            
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Hello! I'm your AI assistant. How can I help you today?"
@@ -173,6 +179,12 @@ class TelegramBotService:
             logger.info(f"MESSAGE: '{user_message}'")
             logger.info("-" * 40)
             
+            # Show typing indicator while processing
+            await context.bot.send_chat_action(
+                chat_id=chat_id,
+                action="typing"
+            )
+            
             # Get response from RAG service
             response = await rag_service.process_message(user_message, "")
             
@@ -184,6 +196,11 @@ class TelegramBotService:
             
             # Send image if present
             if response.get("image_url"):
+                # Show upload photo action
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action="upload_photo"
+                )
                 await context.bot.send_photo(
                     chat_id=chat_id,
                     photo=response["image_url"]

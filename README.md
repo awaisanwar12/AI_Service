@@ -55,7 +55,7 @@ uvicorn app.main:app --reload
 - FastAPI for API endpoints
 - Redis for fast in-memory caching (1-minute TTL)
 - Pinecone for semantic search and vector storage
-- SQLite for conversation persistence
+
 - X AI API for content generation
 
 ## Caching Strategy

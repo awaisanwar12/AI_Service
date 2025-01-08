@@ -2,19 +2,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.services.redis_service import redis_service
 from app.services.rag_service import rag_service
-from app.models.database import SessionLocal, Conversation
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-# Use SessionLocal to create a new session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -26,7 +17,7 @@ class ContentResponse(BaseModel):
 @router.post("/generate", response_model=ContentResponse)
 async def generate_chat_response(request: PromptRequest):
     """
-    Generate a response using X AI API with Redis cache (1 minute) and Pinecone fallback
+    Generate a response using X AI API with Redis cache and Pinecone fallback
     """
     try:
         # Initialize Redis connection if needed
@@ -72,17 +63,6 @@ async def generate_chat_response(request: PromptRequest):
         # If no similar response found, generate new one
         logger.info("No similar response found, generating new response from X AI...")
         result = await rag_service.process_message(request.prompt, "")
-
-        # Store in SQLite for persistence
-        session = SessionLocal()
-        new_conversation = Conversation(
-            chat_id="default",
-            user_message=request.prompt,
-            bot_response=result["text"]
-        )
-        session.add(new_conversation)
-        session.commit()
-        session.close()
 
         return ContentResponse(
             text=result["text"],

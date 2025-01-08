@@ -10,8 +10,7 @@ class Settings(BaseSettings):
     X_AI_API_KEY: str
     PORT: int = 8000
     
-    # Database settings
-    DATABASE_URL: str = "sqlite:///./app.db"
+    
     
     
     
